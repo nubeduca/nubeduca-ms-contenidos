@@ -94,6 +94,17 @@ functions:
       - http: { path: '/files/{fileId}', method: get, cors: true }
       - http: { path: '/files/{fileId}/download', method: get, cors: true }
 
+  # CON-02. Publicar un módulo emite module.published; ms-notificaciones avisa a los alumnos.
+  modulos:
+    handler: api/modulos.lambda_handler
+    events:
+      - http: { path: '/courses/{courseId}/modules', method: get, cors: true }
+      - http: { path: '/courses/{courseId}/modules', method: post, cors: true }
+      - http: { path: '/courses/{courseId}/modules/{moduleId}', method: get, cors: true }
+      - http: { path: '/courses/{courseId}/modules/{moduleId}', method: patch, cors: true }
+      - http: { path: '/courses/{courseId}/modules/{moduleId}/items', method: post, cors: true }
+      - http: { path: '/courses/{courseId}/modules/{moduleId}/publish', method: post, cors: true }
+
   # CON-01. Escanea cada objeto que llega a archivos/ y publica file.scanned.
   # 1 GB de memoria = más CPU para leer hasta 50 MB por bloques.
   antivirus:
