@@ -75,3 +75,20 @@ def a_archivo(item: dict) -> dict:
 
 def path_param(event: dict, nombre: str) -> str:
     return ((event or {}).get("pathParameters") or {}).get(nombre) or ""
+
+
+MODULE_ID = re.compile(r"^mod_[0-9A-HJKMNP-TV-Z]{26}$")
+
+
+def sk_modulo(course_id: str, module_id: str = "") -> str:
+    """Módulo (CON-02). Sus ítems van debajo, así una sola consulta trae el módulo con sus ítems."""
+    return f"MODULE#{course_id}#{module_id}"
+
+
+def sk_item(course_id: str, module_id: str, item_id: str = "") -> str:
+    return f"MODULE#{course_id}#{module_id}#ITEM#{item_id}"
+
+
+def curso_conocido(usuario, course_id: str) -> bool:
+    """El curso existe en este tenant (llegó su course.created)."""
+    return COURSE_ID.match(course_id or "") is not None and _leer(usuario.tenant_id, sk_curso(course_id)) is not None

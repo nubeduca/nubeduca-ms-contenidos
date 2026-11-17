@@ -11,7 +11,7 @@ Contrato: [`apis/ms-contenidos.openapi.yaml`](https://github.com/nubeduca/nubedu
 | [CON-01 · Archivos y Media](https://github.com/nubeduca/nubeduca-backlog/issues/11) | Dev 5 @AIexander-lx | Subida a S3 con URL prefirmada y antivirus en Lambda; publica `file.scanned` y rechaza EICAR |
 | [CON-02 · Contenido y Módulos](https://github.com/nubeduca/nubeduca-backlog/issues/20) | Dev 5 @AIexander-lx | Módulos, páginas e ítems con archivos de CON-01; publica `module.published` |
 
-**Estado:** 🟡 CON-01 implementada (subida con URL prefirmada, antivirus y `file.scanned`), falta desplegarla en AWS. CON-02 empieza después.
+**Estado:** 🟢 CON-01 cerrada (probada en AWS). 🟡 CON-02 implementada: módulos, ítems, `module.published` y seed de 30.000 módulos.
 
 ## Eventos
 
@@ -43,6 +43,19 @@ sequenceDiagram
 - **Permisos.** `CONTENT`: el docente dueño del curso, un docente matriculado como TEACHER o un ADMIN. `SUBMISSION`: cualquier miembro del curso. Una entrega solo la ven quien la subió y los docentes del curso. Los miembros salen de las proyecciones de `course.created` y `enrollment.created/dropped`.
 - **Antivirus** (`antivirus/escaner.py`). Liviano y sin dependencias: busca la firma EICAR en cualquier parte del archivo y compara el SHA-256 con una lista de bloqueados. Un archivo que pasa de 50 MB o no mide lo que se pidió en `sizeBytes` también se rechaza. Si sale `INFECTED`, se borra de S3. La interfaz `escanear(bloques) -> Resultado` permite cambiarlo por ClamAV sin tocar el handler.
 - **Idempotencia.** S3 puede repetir el evento: si el ETag ya se escaneó, no se publica otra vez. Si el archivo se vuelve a subir con la URL vigente, el ETag cambia y se escanea de nuevo (versión +1 y otro `file.scanned`).
+
+## Módulos (CON-02)
+
+| Ruta | Quién | Qué hace |
+|---|---|---|
+| `GET /courses/{courseId}/modules` | miembros del curso, ADMIN | Módulos con sus ítems, por `position`. STUDENT solo ve `PUBLISHED`. |
+| `POST /courses/{courseId}/modules` | docente del curso | Crea el módulo en `DRAFT`. |
+| `GET /courses/{courseId}/modules/{moduleId}` | miembros del curso, ADMIN | Un módulo con sus ítems (al alumno, 404 si está en `DRAFT`). |
+| `PATCH /courses/{courseId}/modules/{moduleId}` | docente del curso | Cambia `title` y/o `position`. |
+| `POST /courses/{courseId}/modules/{moduleId}/items` | docente del curso | `PAGE {title, body}`, `FILE {title, fileId}` o `LINK {title, url}`, al final del módulo. 409 si el archivo no está `CLEAN`; 400 si no es `CONTENT` de este curso. |
+| `POST /courses/{courseId}/modules/{moduleId}/publish` | docente del curso | Pasa a `PUBLISHED` y publica `lms.content.module.published.v1`. 409 si ya está publicado o no tiene ítems. |
+
+"Docente del curso" es el dueño (`course.created`) o un matriculado como TEACHER. El contrato no da escritura al ADMIN. Agregar un ítem `FILE` comprueba en la misma transacción que el archivo siga `CLEAN`. La posición del ítem se asigna con una escritura condicional sobre `itemCount`, así que dos ítems simultáneos no quedan en la misma posición.
 
 ## Estructura de la tabla `<stage>-t_contenidos`
 
@@ -90,13 +103,62 @@ PK `tenant_id` (HASH) + `sk` (RANGE). Los ítems `EVENTO#`, `INBOX#` y `AGG#` so
  "userId": "a18577e2-e005-4a49-a29e-755dbf08f5b6", "enrollmentId": "enr_01JC5F0KPBVF7HK1VV8H23JGMW", "role": "STUDENT"}
 ```
 
-Los módulos e ítems (CON-02) se agregan aquí cuando estén.
+**Módulo** · `sk = MODULE#<courseId>#<moduleId>`
+
+```json
+{
+  "tenant_id": "utec",
+  "sk": "MODULE#crs_01JCQRZHQT9F4WY2JYPDV546K7#mod_01JCJ68VGB8BCT89QZZ38VTKYP",
+  "entidad": "MODULE",
+  "version": 5,
+  "moduleId": "mod_01JCJ68VGB8BCT89QZZ38VTKYP",
+  "courseId": "crs_01JCQRZHQT9F4WY2JYPDV546K7",
+  "title": "Semana 3: Serverless",
+  "position": 3,
+  "status": "PUBLISHED",
+  "itemCount": 3,
+  "createdBy": "c62d9930-b473-4b1d-adec-72fdda7cf599",
+  "createdAt": "2026-11-10T15:00:00Z",
+  "publishedAt": "2026-11-10T15:20:00Z",
+  "publishedBy": "c62d9930-b473-4b1d-adec-72fdda7cf599"
+}
+```
+
+**Ítem de un módulo** · `sk = MODULE#<courseId>#<moduleId>#ITEM#<itemId>`. Va debajo de su módulo, así que una sola consulta por prefijo trae el módulo con sus ítems (o todos los módulos del curso). Lleva `body` (PAGE), `fileId` (FILE) o `url` (LINK).
+
+```json
+{
+  "tenant_id": "utec",
+  "sk": "MODULE#crs_01JCQRZHQT9F4WY2JYPDV546K7#mod_01JCJ68VGB8BCT89QZZ38VTKYP#ITEM#itm_01JCQRZHQT9F4WY2JYPDV546K7",
+  "entidad": "MODULE_ITEM",
+  "moduleId": "mod_01JCJ68VGB8BCT89QZZ38VTKYP",
+  "courseId": "crs_01JCQRZHQT9F4WY2JYPDV546K7",
+  "itemId": "itm_01JCQRZHQT9F4WY2JYPDV546K7",
+  "type": "FILE",
+  "title": "Laboratorio 4",
+  "fileId": "fil_01JCQRZHQT9F4WY2JYPDV546K7",
+  "position": 2,
+  "createdBy": "c62d9930-b473-4b1d-adec-72fdda7cf599",
+  "createdAt": "2026-11-10T15:10:00Z"
+}
+```
+
+## Seed
+
+```bash
+python scripts/poblar_datos.py --stage dev               # 30.000 módulos: UTEC 15.000, UPC 10.000, PUCP 5.000
+python scripts/poblar_datos.py --stage dev --escala 0.01 # 1 % para probar
+```
+
+- 30.000 módulos en la tabla principal, cada uno con una página (`PAGE`): 70 % `PUBLISHED` y 30 % `DRAFT`. No escribe `EVENTO#`.
+- Encaja con el seed de ms-cursos: el módulo *n* de cada tenant es del curso `crs_<n>` de ese seed y trae su proyección `PROY#COURSE#` con el mismo docente dueño. Así los docentes de seed ven sus módulos sin esperar `course.created`.
+- Es idempotente: los ids son fijos.
 
 ## Probar
 
 ```bash
 pip install -r requirements-dev.txt
-python -m pytest -q        # 38 pruebas con moto, sin AWS
+python -m pytest -q        # 65 pruebas con moto, sin AWS
 ```
 
 ## Cómo empezar
