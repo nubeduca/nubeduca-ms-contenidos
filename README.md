@@ -11,7 +11,7 @@ Contrato: [`apis/ms-contenidos.openapi.yaml`](https://github.com/nubeduca/nubedu
 | [CON-01 · Archivos y Media](https://github.com/nubeduca/nubeduca-backlog/issues/11) | Dev 5 @AIexander-lx | Subida a S3 con URL prefirmada y antivirus en Lambda; publica `file.scanned` y rechaza EICAR |
 | [CON-02 · Contenido y Módulos](https://github.com/nubeduca/nubeduca-backlog/issues/20) | Dev 5 @AIexander-lx | Módulos, páginas e ítems con archivos de CON-01; publica `module.published` |
 
-**Estado:** ⚪ Solo README. CON-01 está lista para empezar (su única dependencia, LIB-01, está cerrada); CON-02 espera a CON-01.
+**Estado:** 🟡 CON-01 implementada (subida con URL prefirmada, antivirus y `file.scanned`), falta desplegarla en AWS. CON-02 empieza después.
 
 ## Eventos
 
@@ -20,6 +20,84 @@ Contrato: [`apis/ms-contenidos.openapi.yaml`](https://github.com/nubeduca/nubedu
 | `source` | `lms.content` |
 | Publica | `lms.content.file.scanned.v1` (→ ms-evaluaciones), `lms.content.module.published.v1` (→ ms-notificaciones) |
 | Consume | `lms.courses.course.created.v1`, `lms.courses.enrollment.created.v1`, `lms.courses.enrollment.dropped.v1` |
+
+## Archivos (CON-01)
+
+```mermaid
+sequenceDiagram
+    participant FE as Navegador
+    participant API as λ archivos
+    participant S3 as S3 (bucket privado)
+    participant AV as λ antivirus
+    participant BUS as bus lms
+    FE->>API: POST /files {courseId, purpose, fileName, contentType, sizeBytes}
+    API-->>FE: 201 {fileId, uploadUrl (15 min)} · FILE# en PENDING_UPLOAD
+    FE->>S3: PUT uploadUrl (el binario no pasa por Lambda)
+    S3->>AV: s3:ObjectCreated archivos/<tenant>/<fileId>
+    AV->>AV: PENDING_SCAN, escanea por bloques
+    AV->>BUS: file.scanned {result: CLEAN | INFECTED} (outbox)
+    FE->>API: GET /files/{fileId}/download
+    API-->>FE: 200 URL de 5 min (409 si no está CLEAN)
+```
+
+- **Permisos.** `CONTENT`: el docente dueño del curso, un docente matriculado como TEACHER o un ADMIN. `SUBMISSION`: cualquier miembro del curso. Una entrega solo la ven quien la subió y los docentes del curso. Los miembros salen de las proyecciones de `course.created` y `enrollment.created/dropped`.
+- **Antivirus** (`antivirus/escaner.py`). Liviano y sin dependencias: busca la firma EICAR en cualquier parte del archivo y compara el SHA-256 con una lista de bloqueados. Un archivo que pasa de 50 MB o no mide lo que se pidió en `sizeBytes` también se rechaza. Si sale `INFECTED`, se borra de S3. La interfaz `escanear(bloques) -> Resultado` permite cambiarlo por ClamAV sin tocar el handler.
+- **Idempotencia.** S3 puede repetir el evento: si el ETag ya se escaneó, no se publica otra vez. Si el archivo se vuelve a subir con la URL vigente, el ETag cambia y se escanea de nuevo (versión +1 y otro `file.scanned`).
+
+## Estructura de la tabla `<stage>-t_contenidos`
+
+PK `tenant_id` (HASH) + `sk` (RANGE). Los ítems `EVENTO#`, `INBOX#` y `AGG#` son los de la plantilla.
+
+**Archivo** · `sk = FILE#<fileId>`
+
+```json
+{
+  "tenant_id": "utec",
+  "sk": "FILE#fil_01JCQRZHQT9F4WY2JYPDV546K7",
+  "entidad": "FILE",
+  "version": 2,
+  "fileId": "fil_01JCQRZHQT9F4WY2JYPDV546K7",
+  "courseId": "crs_01JCQRZHQT9F4WY2JYPDV546K7",
+  "purpose": "SUBMISSION",
+  "fileName": "lab4.pdf",
+  "contentType": "application/pdf",
+  "sizeBytes": 1234,
+  "status": "CLEAN",
+  "ownerId": "a18577e2-e005-4a49-a29e-755dbf08f5b6",
+  "createdAt": "2026-11-16T15:00:00Z",
+  "s3Key": "archivos/utec/fil_01JCQRZHQT9F4WY2JYPDV546K7",
+  "scannedAt": "2026-11-16T15:00:04Z",
+  "scannedEtag": "\"9b2cf535f27731c974343645a3985328\"",
+  "scannedBytes": 1234,
+  "scanSignature": "-"
+}
+```
+
+`status`: `PENDING_UPLOAD` → `PENDING_SCAN` → `CLEAN` | `INFECTED`. `scanSignature` es la firma encontrada (`EICAR-Test-File`, `TAMANO_NO_COINCIDE`) o `-`.
+
+**Dueño del curso** (proyección de `course.created`) · `sk = PROY#COURSE#<courseId>`
+
+```json
+{"tenant_id": "utec", "sk": "PROY#COURSE#crs_01JCQRZHQT9F4WY2JYPDV546K7", "entidad": "PROYECCION",
+ "courseId": "crs_01JCQRZHQT9F4WY2JYPDV546K7", "ownerId": "c62d9930-b473-4b1d-adec-72fdda7cf599"}
+```
+
+**Miembro del curso** (proyección de `enrollment.created`; `enrollment.dropped` la borra) · `sk = PROY#ENROLL#<courseId>#<userId>`
+
+```json
+{"tenant_id": "utec", "sk": "PROY#ENROLL#crs_01JCQRZHQT9F4WY2JYPDV546K7#a18577e2-e005-4a49-a29e-755dbf08f5b6",
+ "entidad": "PROYECCION", "courseId": "crs_01JCQRZHQT9F4WY2JYPDV546K7",
+ "userId": "a18577e2-e005-4a49-a29e-755dbf08f5b6", "enrollmentId": "enr_01JC5F0KPBVF7HK1VV8H23JGMW", "role": "STUDENT"}
+```
+
+Los módulos e ítems (CON-02) se agregan aquí cuando estén.
+
+## Probar
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest -q        # 38 pruebas con moto, sin AWS
+```
 
 ## Cómo empezar
 
