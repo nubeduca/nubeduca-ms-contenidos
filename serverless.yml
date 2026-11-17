@@ -1,0 +1,262 @@
+# ms-contenidos: archivos con antivirus (CON-01) y módulos de contenido (CON-02).
+# Contrato: nubeduca-contratos/apis/ms-contenidos.openapi.yaml · source de eventos: lms.content
+#
+# Parámetros (serverless deploy --stage dev --param="outbox=pipe"):
+#   busName   bus de EventBridge. Si no se pasa, se lee del SSM /nubeduca/<stage>/bus-name
+#             (lms-<stage>, de infra/base); si no existe, usa 'lms'.
+#   outbox    lambda (por defecto) | pipe. Cómo viaja el outbox del Stream al bus.
+#   authMode  mock (por defecto, hasta AUTH-01) | cognito.
+#
+# Sin `org:` fija: Serverless v4 toma la org de SERVERLESS_ACCESS_KEY (o de `serverless login`),
+# así el mismo archivo se despliega en la cuenta de cualquier integrante.
+service: nubeduca-ms-contenidos
+
+params:
+  default:
+    outbox: lambda
+    authMode: mock
+
+custom:
+  busName: ${param:busName, ssm:/nubeduca/${sls:stage}/bus-name, 'lms'}
+  relayEncendido:
+    lambda: true
+    pipe: false
+  # El nombre de un bucket es único en todo S3: lleva la cuenta para no chocar entre integrantes.
+  bucketArchivos: nubeduca-${sls:stage}-contenidos-${aws:accountId}
+
+provider:
+  name: aws
+  runtime: python3.13
+  region: us-east-1
+  stage: ${opt:stage, 'dev'}
+  memorySize: 256
+  timeout: 20
+  iam:
+    role: arn:aws:iam::${aws:accountId}:role/LabRole   # Learner Lab no deja crear roles
+  # PLT-06: trazas de API Gateway y Lambda en X-Ray.
+  tracing:
+    apiGateway: true
+    lambda: true
+  environment:
+    SERVICIO: ms-contenidos
+    EVENT_SOURCE: lms.content
+    TABLA: ${sls:stage}-t_contenidos
+    BUCKET: ${self:custom.bucketArchivos}
+    EVENT_BUS: ${self:custom.busName}
+    AUTH_MODE: ${param:authMode}
+  # CON-01: bucket de archivos. Lo crea Serverless porque la Lambda de antivirus se suscribe a él.
+  # Privado: solo se entra con URLs prefirmadas. CORS para que el navegador haga el PUT directo.
+  s3:
+    archivos:
+      name: ${self:custom.bucketArchivos}
+      publicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      bucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      corsConfiguration:
+        CorsRules:
+          - AllowedMethods: [PUT, GET]
+            AllowedOrigins: ['*']
+            AllowedHeaders: ['*']
+            ExposedHeaders: [ETag]
+            MaxAge: 3000
+      lifecycleConfiguration:
+        Rules:
+          - Id: abortar-subidas-incompletas
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+
+package:
+  patterns:
+    - '!tests/**'
+    - '!scripts/**'
+    - '!.venv/**'
+    - '!requirements-dev.txt'
+
+functions:
+  salud:
+    handler: api/salud.lambda_handler
+    events:
+      - http: { path: /health, method: get, cors: true }
+
+  # CON-01. Con AUTH-01 listo, agrega a cada ruta:
+  #   authorizer: { type: COGNITO_USER_POOLS, arn: ${param:userPoolArn} }
+  archivos:
+    handler: api/archivos.lambda_handler
+    events:
+      - http: { path: /files, method: post, cors: true }
+      - http: { path: '/files/{fileId}', method: get, cors: true }
+      - http: { path: '/files/{fileId}/download', method: get, cors: true }
+
+  # CON-01. Escanea cada objeto que llega a archivos/ y publica file.scanned.
+  # 1 GB de memoria = más CPU para leer hasta 50 MB por bloques.
+  antivirus:
+    handler: antivirus/handler.lambda_handler
+    memorySize: 1024
+    timeout: 120
+    events:
+      - s3:
+          bucket: archivos
+          event: s3:ObjectCreated:*
+          rules:
+            - prefix: archivos/
+
+  # Outbox -> bus (solo si outbox=lambda). Lee el Stream y publica los EVENTO#.
+  relayOutbox:
+    handler: relay/stream_a_bus.lambda_handler
+    events:
+      - stream:
+          type: dynamodb
+          arn: !GetAtt Tabla.StreamArn
+          enabled: ${self:custom.relayEncendido.${param:outbox}}
+          startingPosition: LATEST
+          batchSize: 10
+          maximumRetryAttempts: 10
+          filterPatterns:
+            - eventName: [INSERT]
+              dynamodb:
+                Keys:
+                  sk:
+                    S: [{ prefix: 'EVENTO#' }]
+
+  # De ms-cursos: course.created (dueño) y enrollment.created/dropped (quién es miembro del curso).
+  consumidor:
+    handler: consumidores/cursos.lambda_handler
+    events:
+      - sqs:
+          arn: !GetAtt ColaEventos.Arn
+          batchSize: 10
+          functionResponseType: ReportBatchItemFailures
+
+resources:
+  Conditions:
+    UsarPipe: !Equals ['${param:outbox}', 'pipe']
+
+  Resources:
+    # Tabla única: PK tenant_id + sk. El Stream alimenta el outbox.
+    Tabla:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${sls:stage}-t_contenidos
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - { AttributeName: tenant_id, AttributeType: S }
+          - { AttributeName: sk, AttributeType: S }
+        KeySchema:
+          - { AttributeName: tenant_id, KeyType: HASH }
+          - { AttributeName: sk, KeyType: RANGE }
+        StreamSpecification:
+          StreamViewType: NEW_IMAGE
+        TimeToLiveSpecification:
+          AttributeName: ttl
+          Enabled: true
+
+    # Outbox con EventBridge Pipes (outbox=pipe). Falta confirmar que el LabRole lo permita.
+    PipeOutbox:
+      Type: AWS::Pipes::Pipe
+      Condition: UsarPipe
+      Properties:
+        Name: ${self:service}-${sls:stage}-outbox
+        RoleArn: arn:aws:iam::${aws:accountId}:role/LabRole
+        Source: !GetAtt Tabla.StreamArn
+        SourceParameters:
+          DynamoDBStreamParameters:
+            StartingPosition: LATEST
+            BatchSize: 1
+            MaximumRetryAttempts: 10
+          FilterCriteria:
+            Filters:
+              - Pattern: '{"eventName":["INSERT"],"dynamodb":{"Keys":{"sk":{"S":[{"prefix":"EVENTO#"}]}}}}'
+        Target: arn:aws:events:${aws:region}:${aws:accountId}:event-bus/${self:custom.busName}
+        TargetParameters:
+          InputTemplate: '<$.dynamodb.NewImage.detail.S>'
+          EventBridgeEventBusParameters:
+            Source: '$.dynamodb.NewImage.source.S'
+            DetailType: '$.dynamodb.NewImage.detailType.S'
+
+    # --- Consumidor: regla del bus -> cola -> Lambda (DLQ tras 5 intentos) ----------
+    ColaEventosDLQ:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: nubeduca-${sls:stage}-contenidos-eventos-dlq
+        MessageRetentionPeriod: 1209600
+
+    ColaEventos:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: nubeduca-${sls:stage}-contenidos-eventos
+        VisibilityTimeout: 120
+        RedrivePolicy:
+          deadLetterTargetArn: !GetAtt ColaEventosDLQ.Arn
+          maxReceiveCount: 5
+
+    ReglaConsumidor:
+      Type: AWS::Events::Rule
+      Properties:
+        Name: nubeduca-${sls:stage}-contenidos
+        EventBusName: ${self:custom.busName}
+        EventPattern:
+          source: [lms.courses]
+          detail-type:
+            - lms.courses.course.created.v1
+            - lms.courses.enrollment.created.v1
+            - lms.courses.enrollment.dropped.v1
+        Targets:
+          - Id: cola-contenidos
+            Arn: !GetAtt ColaEventos.Arn
+
+    PoliticaColaEventos:
+      Type: AWS::SQS::QueuePolicy
+      Properties:
+        Queues: [!Ref ColaEventos]
+        PolicyDocument:
+          Statement:
+            - Effect: Allow
+              Principal: { Service: events.amazonaws.com }
+              Action: sqs:SendMessage
+              Resource: !GetAtt ColaEventos.Arn
+              Condition:
+                ArnEquals:
+                  aws:SourceArn: !GetAtt ReglaConsumidor.Arn
+
+    # PLT-06: alarma si algún evento termina en la DLQ (falló 5 veces).
+    AlarmaDLQ:
+      Type: AWS::CloudWatch::Alarm
+      Properties:
+        AlarmName: nubeduca-${sls:stage}-contenidos-eventos-dlq
+        AlarmDescription: Hay eventos que ms-contenidos no pudo procesar
+        Namespace: AWS/SQS
+        MetricName: ApproximateNumberOfMessagesVisible
+        Dimensions:
+          - Name: QueueName
+            Value: !GetAtt ColaEventosDLQ.QueueName
+        Statistic: Maximum
+        Period: 60
+        EvaluationPeriods: 1
+        Threshold: 1
+        ComparisonOperator: GreaterThanOrEqualToThreshold
+        TreatMissingData: notBreaching
+
+    # URL de la API para el frontend (infra/frontend de nubeduca-backend la lee de aquí).
+    ApiUrlParam:
+      Type: AWS::SSM::Parameter
+      Properties:
+        Name: /nubeduca/${sls:stage}/api/contenidos/url
+        Type: String
+        Value: !Join ['', ['https://', !Ref ApiGatewayRestApi, '.execute-api.${aws:region}.amazonaws.com/${sls:stage}']]
+
+  Outputs:
+    TablaNombre:
+      Value: !Ref Tabla
+    BucketArchivos:
+      Value: ${self:custom.bucketArchivos}
+    ColaEventosUrl:
+      Value: !Ref ColaEventos
+    ApiUrl:
+      Value: !Join ['', ['https://', !Ref ApiGatewayRestApi, '.execute-api.${aws:region}.amazonaws.com/${sls:stage}']]
